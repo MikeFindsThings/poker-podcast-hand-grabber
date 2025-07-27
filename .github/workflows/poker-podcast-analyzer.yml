@@ -15,17 +15,21 @@ on:
         required: false
         default: '1'
         type: number
+      skip_episodes:
+        description: 'Episodes to skip (0 = latest)'
+        required: false
+        default: '0'
+        type: number
       whisper_model:
         description: 'Whisper model size'
         required: false
-        default: 'medium'
+        default: 'small'
         type: choice
         options:
           - tiny
           - base  
           - small
           - medium
-          - large
 
 env:
   RSS_FEED: 'https://feeds.buzzsprout.com/2227971.rss'
@@ -33,7 +37,7 @@ env:
 jobs:
   analyze-podcast:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # 2 hours max
+    timeout-minutes: 180  # 3 hours for long episodes
     
     steps:
     - name: Checkout repository
@@ -76,12 +80,19 @@ jobs:
         feed = feedparser.parse('${{ github.event.inputs.rss_url || env.RSS_FEED }}')
         current_episodes = [entry.id for entry in feed.entries[:5]]
         
-        # Check for new episodes
-        new_episodes = [ep for ep in current_episodes if ep not in previous_episodes]
+        # For manual runs, always process (ignore previous episodes)
+        is_manual = '${{ github.event_name }}' == 'workflow_dispatch'
+        
+        if is_manual:
+            new_episodes = current_episodes[:int('${{ github.event.inputs.max_episodes || 1 }}')]
+            print('Manual run - processing requested episodes')
+        else:
+            # Check for new episodes
+            new_episodes = [ep for ep in current_episodes if ep not in previous_episodes]
         
         print(f'Previous episodes: {len(previous_episodes)}')
         print(f'Current episodes: {len(current_episodes)}')
-        print(f'New episodes: {len(new_episodes)}')
+        print(f'Episodes to process: {len(new_episodes)}')
         
         # Set output for GitHub Actions
         import os
@@ -90,17 +101,23 @@ jobs:
             f.write(f'new_episode_count={len(new_episodes)}\n')
         "
         
-    - name: Process new episodes
+    - name: Process episodes
       if: steps.check_episodes.outputs.has_new_episodes == 'true'
       run: |
+        # Show start time
+        echo "🎧 Starting podcast processing at $(date)"
+        
         python3 src/cli.py \
           --rss "${{ github.event.inputs.rss_url || env.RSS_FEED }}" \
           --max-episodes "${{ github.event.inputs.max_episodes || '1' }}" \
-          --model "${{ github.event.inputs.whisper_model || 'medium' }}" \
+          --skip-episodes "${{ github.event.inputs.skip_episodes || '0' }}" \
+          --model "${{ github.event.inputs.whisper_model || 'small' }}" \
           --output-dir ./results
           
+        echo "✅ Processing completed at $(date)"
+          
     - name: Update processed episodes list
-      if: steps.check_episodes.outputs.has_new_episodes == 'true'
+      if: steps.check_episodes.outputs.has_new_episodes == 'true' && github.event_name != 'workflow_dispatch'
       run: |
         python3 -c "
         import feedparser
@@ -124,23 +141,29 @@ jobs:
           processed_episodes.json
         retention-days: 30
         
-    - name: Commit results to repository
-      if: steps.check_episodes.outputs.has_new_episodes == 'true'
+    - name: Commit results to repository  
+      if: steps.check_episodes.outputs.has_new_episodes == 'true' && github.event_name != 'workflow_dispatch'
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add results/ processed_episodes.json
+        git add results/ processed_episodes.json || true
         git commit -m "🃏 Auto-processed ${{ steps.check_episodes.outputs.new_episode_count }} new poker episode(s)" || exit 0
-        git push
+        git push || echo "Nothing to push"
         
     - name: Create summary
       if: always()
       run: |
         echo "## Poker Podcast Analysis Results 🃏" >> $GITHUB_STEP_SUMMARY
         if [ "${{ steps.check_episodes.outputs.has_new_episodes }}" == "true" ]; then
-          echo "✅ Processed ${{ steps.check_episodes.outputs.new_episode_count }} new episode(s)" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Processed ${{ steps.check_episodes.outputs.new_episode_count }} episode(s)" >> $GITHUB_STEP_SUMMARY
           echo "📊 Results saved to \`results/\` directory" >> $GITHUB_STEP_SUMMARY
+          if [ -d "results" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Generated Files:" >> $GITHUB_STEP_SUMMARY
+            find results -name "*.md" -exec basename {} \; | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY
+          fi
         else
           echo "ℹ️ No new episodes found" >> $GITHUB_STEP_SUMMARY
         fi
-        echo "🕐 Last checked: $(date)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "🕐 Completed at: $(date)" >> $GITHUB_STEP_SUMMARY
