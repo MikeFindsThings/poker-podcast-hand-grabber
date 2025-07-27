@@ -1,0 +1,146 @@
+name: Poker Podcast Analyzer
+
+on:
+  schedule:
+    # Run daily at 9 AM UTC (adjust timezone as needed)
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      rss_url:
+        description: 'RSS Feed URL'
+        required: false
+        default: 'https://feeds.buzzsprout.com/2227971.rss'
+      max_episodes:
+        description: 'Max episodes to process'
+        required: false
+        default: '1'
+        type: number
+      whisper_model:
+        description: 'Whisper model size'
+        required: false
+        default: 'medium'
+        type: choice
+        options:
+          - tiny
+          - base  
+          - small
+          - medium
+          - large
+
+env:
+  RSS_FEED: 'https://feeds.buzzsprout.com/2227971.rss'
+
+jobs:
+  analyze-podcast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # 2 hours max
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+        
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+        
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        python -m spacy download en_core_web_sm
+        
+    - name: Check for new episodes
+      id: check_episodes
+      run: |
+        # Create a simple script to check if we have new episodes
+        python3 -c "
+        import feedparser
+        import json
+        from pathlib import Path
+        
+        # Load previous episodes if they exist
+        prev_file = Path('processed_episodes.json')
+        previous_episodes = []
+        if prev_file.exists():
+            with open(prev_file, 'r') as f:
+                previous_episodes = json.load(f)
+        
+        # Get current episodes
+        feed = feedparser.parse('${{ github.event.inputs.rss_url || env.RSS_FEED }}')
+        current_episodes = [entry.id for entry in feed.entries[:5]]
+        
+        # Check for new episodes
+        new_episodes = [ep for ep in current_episodes if ep not in previous_episodes]
+        
+        print(f'Previous episodes: {len(previous_episodes)}')
+        print(f'Current episodes: {len(current_episodes)}')
+        print(f'New episodes: {len(new_episodes)}')
+        
+        # Set output for GitHub Actions
+        import os
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'has_new_episodes={\"true\" if new_episodes else \"false\"}\n')
+            f.write(f'new_episode_count={len(new_episodes)}\n')
+        "
+        
+    - name: Process new episodes
+      if: steps.check_episodes.outputs.has_new_episodes == 'true'
+      run: |
+        python3 src/cli.py \
+          --rss "${{ github.event.inputs.rss_url || env.RSS_FEED }}" \
+          --max-episodes "${{ github.event.inputs.max_episodes || '1' }}" \
+          --model "${{ github.event.inputs.whisper_model || 'medium' }}" \
+          --output-dir ./results
+          
+    - name: Update processed episodes list
+      if: steps.check_episodes.outputs.has_new_episodes == 'true'
+      run: |
+        python3 -c "
+        import feedparser
+        import json
+        from pathlib import Path
+        
+        feed = feedparser.parse('${{ github.event.inputs.rss_url || env.RSS_FEED }}')
+        episodes = [entry.id for entry in feed.entries[:10]]  # Keep last 10
+        
+        with open('processed_episodes.json', 'w') as f:
+            json.dump(episodes, f, indent=2)
+        "
+        
+    - name: Upload results as artifacts
+      if: steps.check_episodes.outputs.has_new_episodes == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: poker-hands-analysis-${{ github.run_number }}
+        path: |
+          results/
+          processed_episodes.json
+        retention-days: 30
+        
+    - name: Commit results to repository
+      if: steps.check_episodes.outputs.has_new_episodes == 'true'
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add results/ processed_episodes.json
+        git commit -m "🃏 Auto-processed ${{ steps.check_episodes.outputs.new_episode_count }} new poker episode(s)" || exit 0
+        git push
+        
+    - name: Create summary
+      if: always()
+      run: |
+        echo "## Poker Podcast Analysis Results 🃏" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ steps.check_episodes.outputs.has_new_episodes }}" == "true" ]; then
+          echo "✅ Processed ${{ steps.check_episodes.outputs.new_episode_count }} new episode(s)" >> $GITHUB_STEP_SUMMARY
+          echo "📊 Results saved to \`results/\` directory" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ No new episodes found" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "🕐 Last checked: $(date)" >> $GITHUB_STEP_SUMMARY
